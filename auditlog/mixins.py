@@ -9,6 +9,7 @@ from django.urls.exceptions import NoReverseMatch
 from django.utils.html import format_html, format_html_join
 from django.utils.safestring import mark_safe
 from django.utils.timezone import localtime
+from django.utils.translation import ngettext, gettext_lazy as _
 
 from auditlog.models import LogEntry
 from auditlog.registry import auditlog
@@ -18,11 +19,11 @@ MAX = 75
 
 
 class LogEntryAdminMixin:
-    @admin.display(description="Created")
+    @admin.display(description=_("Created"))
     def created(self, obj):
         return localtime(obj.timestamp)
 
-    @admin.display(description="User")
+    @admin.display(description=_("User"))
     def user_url(self, obj):
         if obj.actor:
             app_label, model = settings.AUTH_USER_MODEL.split(".")
@@ -35,7 +36,7 @@ class LogEntryAdminMixin:
 
         return "system"
 
-    @admin.display(description="Resource")
+    @admin.display(description=_("Resource"))
     def resource_url(self, obj):
         app_label, model = obj.content_type.app_label, obj.content_type.model
         viewname = f"admin:{app_label}_{model}_change"
@@ -49,19 +50,19 @@ class LogEntryAdminMixin:
                 '<a href="{}">{} - {}</a>', link, obj.content_type, obj.object_repr
             )
 
-    @admin.display(description="Changes")
+    @admin.display(description=_("Changes"))
     def msg_short(self, obj):
         if obj.action in [LogEntry.Action.DELETE, LogEntry.Action.ACCESS]:
             return ""  # delete
         changes = json.loads(obj.changes)
-        s = "" if len(changes) == 1 else "s"
+        s = ngettext( 'change', 'changes', len(changes) )
         fields = ", ".join(changes.keys())
         if len(fields) > MAX:
             i = fields.rfind(" ", 0, MAX)
             fields = fields[:i] + " .."
-        return "%d change%s: %s" % (len(changes), s, fields)
+        return "%d %s: %s" % (len(changes), s, fields)
 
-    @admin.display(description="Changes")
+    @admin.display(description=_("Changes"))
     def msg(self, obj):
         changes = json.loads(obj.changes)
 
@@ -81,7 +82,7 @@ class LogEntryAdminMixin:
 
         if atom_changes:
             msg.append("<table>")
-            msg.append(self._format_header("#", "Field", "From", "To"))
+            msg.append(self._format_header("#", _("Field"), _("From"), _("To")))
             for i, (field, change) in enumerate(sorted(atom_changes.items()), 1):
                 value = [i, self.field_verbose_name(obj, field)] + (
                     ["***", "***"] if field == "password" else change
@@ -91,7 +92,7 @@ class LogEntryAdminMixin:
 
         if m2m_changes:
             msg.append("<table>")
-            msg.append(self._format_header("#", "Relationship", "Action", "Objects"))
+            msg.append(self._format_header("#", _("Relationship"), _("Action"), _("Objects")))
             for i, (field, change) in enumerate(sorted(m2m_changes.items()), 1):
                 change_html = format_html_join(
                     mark_safe("<br>"),
