@@ -19,6 +19,7 @@ setup(
     package_data={
         "auditlog": ["locale/*/LC_MESSAGES/*.po", "locale/*/LC_MESSAGES/*.mo"],
     },
+    include_package_data=True,
     url="https://github.com/jazzband/django-auditlog",
     project_urls={
         "Documentation": "https://django-auditlog.readthedocs.io",
