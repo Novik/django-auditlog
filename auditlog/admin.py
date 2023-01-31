@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.utils.translation import gettext_lazy as _
 
-from auditlog.filters import CIDFilter, ResourceTypeFilter
+from auditlog.filters import ResourceTypeFilter
 from auditlog.mixins import LogEntryAdminMixin
 from auditlog.models import LogEntry
 
@@ -16,7 +16,7 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         "action",
         "msg_short",
         "user_url",
-        "cid_url",
+        "content_type__model",
     ]
     search_fields = [
         "timestamp",
@@ -26,7 +26,7 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         "actor__last_name",
         f"actor__{get_user_model().USERNAME_FIELD}",
     ]
-    list_filter = ["action", ResourceTypeFilter, CIDFilter]
+    list_filter = ["action", ResourceTypeFilter]
     readonly_fields = ["created", "resource_url", "action", "user_url", "msg"]
     fieldsets = [
         (None, {"fields": ["created", "user_url", "resource_url", "cid"]}),
