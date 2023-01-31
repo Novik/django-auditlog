@@ -16,7 +16,7 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         "action",
         "msg_short",
         "user_url",
-        "content_type__model",
+        "model_name",
     ]
     search_fields = [
         "timestamp",
@@ -45,3 +45,9 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
     def get_queryset(self, request):
         self.request = request
         return super().get_queryset(request=request)
+
+    def model_name(self, obj):
+        return obj.content_type.model if obj.content_type else ''
+
+    model_name.admin_order_field = "content_type__model"
+    model_name.short_description = _('Model')
