@@ -1,9 +1,11 @@
 import datetime
 import itertools
 import json
+import random
 import warnings
 from datetime import timezone
 from unittest import mock
+from unittest.mock import patch
 
 import freezegun
 from dateutil.tz import gettz
@@ -21,11 +23,14 @@ from django.utils import dateformat, formats
 from django.utils import timezone as django_timezone
 
 from auditlog.admin import LogEntryAdmin
+from auditlog.cid import get_cid
 from auditlog.context import disable_auditlog, set_actor
 from auditlog.diff import model_instance_diff
 from auditlog.middleware import AuditlogMiddleware
 from auditlog.models import LogEntry
 from auditlog.registry import AuditlogModelRegistry, AuditLogRegistrationError, auditlog
+from auditlog.signals import post_log, pre_log
+from auditlog_tests.fixtures.custom_get_cid import get_cid as custom_get_cid
 from auditlog_tests.models import (
     AdditionalDataIncludedModel,
     AltPrimaryKeyModel,
@@ -100,9 +105,9 @@ class SimpleModelTest(TestCase):
         obj.save()
 
     def check_update_log_entry(self, obj, history):
-        self.assertJSONEqual(
+        self.assertDictEqual(
             history.changes,
-            '{"boolean": ["False", "True"]}',
+            {"boolean": ["False", "True"]},
             msg="The change is correctly logged",
         )
 
@@ -115,9 +120,9 @@ class SimpleModelTest(TestCase):
         obj.save(update_fields=["boolean"])
 
         # This implicitly asserts there is only one UPDATE change since the `.get` would fail otherwise.
-        self.assertJSONEqual(
+        self.assertDictEqual(
             obj.history.get(action=LogEntry.Action.UPDATE).changes,
-            '{"boolean": ["False", "True"]}',
+            {"boolean": ["False", "True"]},
             msg=(
                 "Object modifications that are not saved to DB are not logged "
                 "when using the `update_fields`."
@@ -148,9 +153,9 @@ class SimpleModelTest(TestCase):
         obj.integer = 1
         obj.boolean = True
         obj.save(update_fields=None)
-        self.assertJSONEqual(
+        self.assertDictEqual(
             obj.history.get(action=LogEntry.Action.UPDATE).changes,
-            '{"boolean": ["False", "True"], "integer": ["None", "1"]}',
+            {"boolean": ["False", "True"], "integer": ["None", "1"]},
             msg="The 2 fields changed are correctly logged",
         )
 
@@ -199,6 +204,24 @@ class SimpleModelTest(TestCase):
         self.assertEqual(
             log_entry._state.db, "default", msg=msg
         )  # must be created in default database
+
+    def test_default_timestamp(self):
+        start = django_timezone.now()
+        self.test_recreate()
+        end = django_timezone.now()
+        history = self.obj.history.latest()
+        self.assertTrue(start <= history.timestamp <= end)
+
+    def test_manual_timestamp(self):
+        timestamp = datetime.datetime(1999, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+        LogEntry.objects.log_create(
+            instance=self.obj,
+            timestamp=timestamp,
+            changes="foo bar",
+            action=LogEntry.Action.UPDATE,
+        )
+        history = self.obj.history.filter(timestamp=timestamp, changes="foo bar")
+        self.assertTrue(history.exists())
 
 
 class NoActorMixin:
@@ -410,7 +433,7 @@ class MiddlewareTest(TestCase):
         request = self.factory.get("/")
         request.user = AnonymousUser()
 
-        self.get_response_mock.side_effect = self.side_effect(self.assert_no_listeners)
+        self.get_response_mock.side_effect = self.side_effect(self.assert_has_listeners)
 
         response = self.middleware(request)
 
@@ -450,6 +473,11 @@ class MiddlewareTest(TestCase):
             ({}, "127.0.0.1"),
             ({"HTTP_X_FORWARDED_FOR": "127.0.0.2"}, "127.0.0.2"),
             ({"HTTP_X_FORWARDED_FOR": "127.0.0.3:1234"}, "127.0.0.3"),
+            ({"HTTP_X_FORWARDED_FOR": "2606:4700:4700::1111"}, "2606:4700:4700::1111"),
+            (
+                {"HTTP_X_FORWARDED_FOR": "[2606:4700:4700::1001]:1234"},
+                "2606:4700:4700::1001",
+            ),
         ]
         for headers, expected_remote_addr in tests:
             with self.subTest(headers=headers):
@@ -457,6 +485,70 @@ class MiddlewareTest(TestCase):
                 self.assertEqual(
                     self.middleware._get_remote_addr(request), expected_remote_addr
                 )
+
+    def test_cid(self):
+        header = str(settings.AUDITLOG_CID_HEADER).lstrip("HTTP_").replace("_", "-")
+        header_meta = "HTTP_" + header.upper().replace("-", "_")
+        cid = "random_CID"
+
+        _settings = [
+            # these tuples test reading the cid from the header defined in the settings
+            ({"AUDITLOG_CID_HEADER": header}, cid),  # x-correlation-id
+            ({"AUDITLOG_CID_HEADER": header_meta}, cid),  # HTTP_X_CORRELATION_ID
+            ({"AUDITLOG_CID_HEADER": None}, None),
+            # these two tuples test using a custom getter.
+            # Here, we don't necessarily care about the cid that was set in set_cid
+            (
+                {
+                    "AUDITLOG_CID_GETTER": "auditlog_tests.fixtures.custom_get_cid.get_cid"
+                },
+                custom_get_cid(),
+            ),
+            ({"AUDITLOG_CID_GETTER": custom_get_cid}, custom_get_cid()),
+        ]
+        for setting, expected_result in _settings:
+            with self.subTest():
+                with self.settings(**setting):
+                    request = self.factory.get("/", **{header_meta: cid})
+                    self.middleware(request)
+
+                    obj = SimpleModel.objects.create(text="I am not difficult.")
+                    history = obj.history.get(action=LogEntry.Action.CREATE)
+
+                    self.assertEqual(history.cid, expected_result)
+                    self.assertEqual(get_cid(), expected_result)
+
+    def test_set_actor_anonymous_request(self):
+        """
+        The remote address will be set even when there is no actor
+        """
+        remote_addr = "123.213.145.99"
+        actor = None
+
+        with set_actor(actor=actor, remote_addr=remote_addr):
+            obj = SimpleModel.objects.create(text="I am not difficult.")
+
+            history = obj.history.get()
+            self.assertEqual(
+                history.remote_addr,
+                remote_addr,
+                msg=f"Remote address is {remote_addr}",
+            )
+            self.assertIsNone(history.actor, msg="Actor is `None` for anonymous user")
+
+    def test_get_actor(self):
+        params = [
+            (AnonymousUser(), None, "The user is anonymous so the actor is `None`"),
+            (self.user, self.user, "The use is authenticated so it is the actor"),
+            (None, None, "There is no actor"),
+            ("1234", None, "The value of request.user is not a valid user model"),
+        ]
+        for user, actor, msg in params:
+            with self.subTest(msg):
+                request = self.factory.get("/")
+                request.user = user
+
+                self.assertEqual(self.middleware._get_actor(request), actor)
 
 
 class SimpleIncludeModelTest(TestCase):
@@ -477,9 +569,9 @@ class SimpleIncludeModelTest(TestCase):
         obj.text = "Newer text"
         obj.save(update_fields=["text", "label"])
 
-        self.assertJSONEqual(
+        self.assertDictEqual(
             obj.history.get(action=LogEntry.Action.UPDATE).changes,
-            '{"label": ["Initial label", "New label"]}',
+            {"label": ["Initial label", "New label"]},
             msg="Only the label was logged, regardless of multiple entries in `update_fields`",
         )
 
@@ -570,7 +662,7 @@ class SimpleMappingModelTest(TestCase):
         )
 
 
-class SimpeMaskedFieldsModelTest(TestCase):
+class SimpleMaskedFieldsModelTest(TestCase):
     """Log masked changes for fields in mask_fields"""
 
     def test_register_mask_fields(self):
@@ -1067,6 +1159,26 @@ class RegisterModelSettingsTest(TestCase):
             ):
                 self.test_auditlog.register_from_settings()
 
+        with override_settings(
+            AUDITLOG_INCLUDE_ALL_MODELS=True,
+            AUDITLOG_EXCLUDE_TRACKING_FIELDS="badvalue",
+        ):
+            with self.assertRaisesMessage(
+                TypeError,
+                "Setting 'AUDITLOG_EXCLUDE_TRACKING_FIELDS' must be a list or tuple",
+            ):
+                self.test_auditlog.register_from_settings()
+
+        with override_settings(
+            AUDITLOG_EXCLUDE_TRACKING_FIELDS=("created", "modified")
+        ):
+            with self.assertRaisesMessage(
+                ValueError,
+                "In order to use 'AUDITLOG_EXCLUDE_TRACKING_FIELDS', "
+                "setting 'AUDITLOG_INCLUDE_ALL_MODELS' must be set to 'True'",
+            ):
+                self.test_auditlog.register_from_settings()
+
         with override_settings(AUDITLOG_INCLUDE_TRACKING_MODELS="str"):
             with self.assertRaisesMessage(
                 TypeError,
@@ -1098,6 +1210,18 @@ class RegisterModelSettingsTest(TestCase):
             ):
                 self.test_auditlog.register_from_settings()
 
+        with override_settings(
+            AUDITLOG_INCLUDE_TRACKING_MODELS=({"model": "notanapp.test"},)
+        ):
+            with self.assertRaisesMessage(
+                AuditLogRegistrationError,
+                (
+                    "An error was encountered while registering model 'notanapp.test'"
+                    " - make sure the app is registered correctly."
+                ),
+            ):
+                self.test_auditlog.register_from_settings()
+
         with override_settings(AUDITLOG_DISABLE_ON_RAW_SAVE="bad value"):
             with self.assertRaisesMessage(
                 TypeError, "Setting 'AUDITLOG_DISABLE_ON_RAW_SAVE' must be a boolean"
@@ -1108,7 +1232,35 @@ class RegisterModelSettingsTest(TestCase):
         AUDITLOG_INCLUDE_ALL_MODELS=True,
         AUDITLOG_EXCLUDE_TRACKING_MODELS=("auditlog_tests.SimpleExcludeModel",),
     )
-    def test_register_from_settings_register_all_models_with_exclude_models(self):
+    def test_register_from_settings_register_all_models_with_exclude_models_tuple(self):
+        self.test_auditlog.register_from_settings()
+
+        self.assertFalse(self.test_auditlog.contains(SimpleExcludeModel))
+        self.assertTrue(self.test_auditlog.contains(ChoicesFieldModel))
+
+    @override_settings(
+        AUDITLOG_INCLUDE_ALL_MODELS=True,
+        AUDITLOG_EXCLUDE_TRACKING_FIELDS=("datetime",),
+    )
+    def test_register_from_settings_register_all_models_with_exclude_tracking_fields(
+        self,
+    ):
+        self.test_auditlog.register_from_settings()
+
+        self.assertEqual(
+            self.test_auditlog.get_model_fields(SimpleModel)["exclude_fields"],
+            ["datetime"],
+        )
+        self.assertEqual(
+            self.test_auditlog.get_model_fields(AltPrimaryKeyModel)["exclude_fields"],
+            ["datetime"],
+        )
+
+    @override_settings(
+        AUDITLOG_INCLUDE_ALL_MODELS=True,
+        AUDITLOG_EXCLUDE_TRACKING_MODELS=["auditlog_tests.SimpleExcludeModel"],
+    )
+    def test_register_from_settings_register_all_models_with_exclude_models_list(self):
         self.test_auditlog.register_from_settings()
 
         self.assertFalse(self.test_auditlog.contains(SimpleExcludeModel))
@@ -1191,7 +1343,7 @@ class ChoicesFieldModelTest(TestCase):
         assert "related_models" in history.changes_display_dict
 
 
-class CharfieldTextfieldModelTest(TestCase):
+class CharFieldTextFieldModelTest(TestCase):
     def setUp(self):
         self.PLACEHOLDER_LONGCHAR = "s" * 255
         self.PLACEHOLDER_LONGTEXTFIELD = "s" * 1000
@@ -1292,7 +1444,7 @@ class AdminPanelTest(TestCase):
         res = self.client.get(f"/admin/auditlog/logentry/{log_pk}/", follow=True)
         self.assertEqual(res.status_code, 200)
         res = self.client.get(f"/admin/auditlog/logentry/{log_pk}/delete/")
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.status_code, 403)
         res = self.client.get(f"/admin/auditlog/logentry/{log_pk}/history/")
         self.assertEqual(res.status_code, 200)
 
@@ -1309,6 +1461,21 @@ class AdminPanelTest(TestCase):
                 created = self.admin.created(log_entry)
                 self.assertEqual(created.strftime("%Y-%m-%d %H:%M:%S"), timestamp)
 
+    def test_cid(self):
+        self.client.force_login(self.user)
+        expected_response = (
+            '<a href="/admin/auditlog/logentry/?cid=123" '
+            'title="Click to filter by records with this correlation id">123</a>'
+        )
+
+        log_entry = self.obj.history.latest()
+        log_entry.cid = "123"
+        log_entry.save()
+
+        res = self.client.get("/admin/auditlog/logentry/")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(expected_response, res.rendered_content)
+
 
 class DiffMsgTest(TestCase):
     def setUp(self):
@@ -1320,7 +1487,27 @@ class DiffMsgTest(TestCase):
         return LogEntry.objects.log_create(
             SimpleModel.objects.create(),  # doesn't affect anything
             action=action,
-            changes=json.dumps(changes),
+            changes=changes,
+        )
+
+    def test_change_msg_create_when_exceeds_max_len(self):
+        log_entry = self._create_log_entry(
+            LogEntry.Action.CREATE,
+            {
+                "Camelopardalis": [None, "Giraffe"],
+                "Capricornus": [None, "Sea goat"],
+                "Equuleus": [None, "Little horse"],
+                "Horologium": [None, "Clock"],
+                "Microscopium": [None, "Microscope"],
+                "Reticulum": [None, "Net"],
+                "Telescopium": [None, "Telescope"],
+            },
+        )
+
+        self.assertEqual(
+            self.admin.msg_short(log_entry),
+            "7 changes: Camelopardalis, Capricornus, Equuleus, Horologium, "
+            "Microscopium, ..",
         )
 
     def test_changes_msg_delete(self):
@@ -1494,9 +1681,9 @@ class JSONModelTest(TestCase):
 
         history = obj.history.get(action=LogEntry.Action.UPDATE)
 
-        self.assertJSONEqual(
+        self.assertDictEqual(
             history.changes,
-            '{"json": ["{}", "{\'quantity\': \'1\'}"]}',
+            {"json": ["{}", '{"quantity": "1"}']},
             msg="The change is correctly logged",
         )
 
@@ -1587,6 +1774,170 @@ class ModelInstanceDiffTest(TestCase):
             {"boolean": ("True", "False")},
             msg="ObjectDoesNotExist should be handled",
         )
+
+    def test_diff_models_with_json_fields(self):
+        first = JSONModel.objects.create(
+            json={
+                "code": "17",
+                "date": datetime.date(2022, 1, 1),
+                "description": "first",
+            }
+        )
+        first.refresh_from_db()  # refresh json data from db
+        second = JSONModel.objects.create(
+            json={
+                "code": "17",
+                "description": "second",
+                "date": datetime.date(2023, 1, 1),
+            }
+        )
+        diff = model_instance_diff(first, second, ["json"])
+
+        self.assertDictEqual(
+            diff,
+            {
+                "json": (
+                    '{"code": "17", "date": "2022-01-01", "description": "first"}',
+                    '{"code": "17", "date": "2023-01-01", "description": "second"}',
+                )
+            },
+        )
+
+
+class TestRelatedDiffs(TestCase):
+    def setUp(self):
+        self.test_date = datetime.datetime(2022, 1, 1, 12, tzinfo=datetime.timezone.utc)
+
+    def test_log_entry_changes_on_fk_object_update(self):
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create()
+            one_simple = SimpleModel.objects.create()
+            two_simple = SimpleModel.objects.create()
+            instance = RelatedModel.objects.create(
+                one_to_one=simple, related=one_simple
+            )
+
+        t2 = self.test_date + datetime.timedelta(days=20)
+        with freezegun.freeze_time(t2):
+            instance.related = two_simple
+            instance.save()
+
+        log_one = instance.history.filter(timestamp=t1).first()
+        log_two = instance.history.filter(timestamp=t2).first()
+        self.assertTrue(isinstance(log_one, LogEntry))
+        self.assertTrue(isinstance(log_two, LogEntry))
+
+        self.assertEqual(int(log_one.changes_dict["related"][1]), one_simple.id)
+        self.assertEqual(int(log_one.changes_dict["one_to_one"][1]), simple.id)
+        self.assertEqual(int(log_two.changes_dict["related"][1]), two_simple.id)
+
+    def test_log_entry_changes_on_fk_id_update(self):
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create()
+            one_simple = SimpleModel.objects.create()
+            two_simple = SimpleModel.objects.create()
+            instance = RelatedModel.objects.create(
+                one_to_one_id=int(simple.id), related_id=int(one_simple.id)
+            )
+
+        t2 = self.test_date + datetime.timedelta(days=20)
+        with freezegun.freeze_time(t2):
+            instance.related_id = int(two_simple.id)
+            instance.save()
+
+        log_one = instance.history.filter(timestamp=t1).first()
+        log_two = instance.history.filter(timestamp=t2).first()
+        self.assertTrue(isinstance(log_one, LogEntry))
+        self.assertTrue(isinstance(log_two, LogEntry))
+
+        self.assertEqual(int(log_one.changes_dict["related"][1]), one_simple.id)
+        self.assertEqual(int(log_one.changes_dict["one_to_one"][1]), simple.id)
+        self.assertEqual(int(log_two.changes_dict["related"][1]), two_simple.id)
+
+    def test_log_entry_create_fk_changes_to_string_objects_in_display_dict(self):
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create(text="Test Foo")
+            one_simple = SimpleModel.objects.create(text="Test Bar")
+            instance = RelatedModel.objects.create(
+                one_to_one=simple, related=one_simple
+            )
+
+        log_one = instance.history.filter(timestamp=t1).first()
+        self.assertTrue(isinstance(log_one, LogEntry))
+        display_dict = log_one.changes_display_dict
+        self.assertEqual(display_dict["related"][1], "Test Bar")
+        self.assertEqual(display_dict["related"][0], "None")
+        self.assertEqual(display_dict["one to one"][1], "Test Foo")
+
+    def test_log_entry_deleted_fk_changes_to_string_objects_in_display_dict(self):
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create(text="Test Foo")
+            one_simple = SimpleModel.objects.create(text="Test Bar")
+            one_simple_id = int(one_simple.id)
+            instance = RelatedModel.objects.create(
+                one_to_one=simple, related=one_simple
+            )
+
+        t2 = self.test_date + datetime.timedelta(days=20)
+        with freezegun.freeze_time(t2):
+            one_simple.delete()
+
+        log_two = LogEntry.objects.filter(object_id=instance.id, timestamp=t2).first()
+        self.assertTrue(isinstance(log_two, LogEntry))
+        display_dict = log_two.changes_display_dict
+        self.assertEqual(
+            display_dict["related"][0], f"Deleted 'SimpleModel' ({one_simple_id})"
+        )
+        self.assertEqual(display_dict["related"][1], "None")
+
+    def test_no_log_entry_created_on_related_object_string_update(self):
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create(text="Test Foo")
+            one_simple = SimpleModel.objects.create(text="Test Bar")
+            instance = RelatedModel.objects.create(
+                one_to_one=simple, related=one_simple
+            )
+
+        t2 = self.test_date + datetime.timedelta(days=20)
+        with freezegun.freeze_time(t2):
+            # Order is important. Without special FK handling, the arbitrary in memory
+            # changes to the (same) related object's signature result in a perceived
+            # update where no update has occurred.
+            one_simple.text = "Test Baz"
+            instance.save()
+            one_simple.save()
+
+        # Assert that only one log for the instance was created
+        self.assertEqual(instance.history.all().count(), 1)
+        # Assert that two logs were created for the parent object
+        self.assertEqual(one_simple.history.all().count(), 2)
+
+    def test_log_entry_created_if_obj_strings_are_same_for_two_objs(self):
+        """FK changes trigger update when the string representation is the same."""
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create(text="Test Foo")
+            one_simple = SimpleModel.objects.create(text="Twinsies", boolean=True)
+            two_simple = SimpleModel.objects.create(text="Twinsies", boolean=False)
+            instance = RelatedModel.objects.create(
+                one_to_one=simple, related=one_simple
+            )
+
+        t2 = self.test_date + datetime.timedelta(days=20)
+        with freezegun.freeze_time(t2):
+            instance.related = two_simple
+            instance.save()
+
+        self.assertEqual(instance.history.all().count(), 2)
+        log_create = instance.history.filter(timestamp=t1).first()
+        log_update = instance.history.filter(timestamp=t2).first()
+        self.assertEqual(int(log_create.changes_dict["related"][1]), one_simple.id)
+        self.assertEqual(int(log_update.changes_dict["related"][1]), two_simple.id)
 
 
 class TestModelSerialization(TestCase):
@@ -1835,7 +2186,169 @@ class TestAccessLog(TestCase):
         self.assertEqual(
             log_entry.action, LogEntry.Action.ACCESS, msg="Action is 'ACCESS'"
         )
-        self.assertEqual(log_entry.changes, "null")
+        self.assertIsNone(log_entry.changes)
+        self.assertEqual(log_entry.changes_dict, {})
+
+
+class SignalTests(TestCase):
+    def setUp(self):
+        self.obj = SimpleModel.objects.create(text="I am not difficult.")
+        self.my_pre_log_data = {
+            "is_called": False,
+            "my_sender": None,
+            "my_instance": None,
+            "my_action": None,
+        }
+        self.my_post_log_data = {
+            "is_called": False,
+            "my_sender": None,
+            "my_instance": None,
+            "my_action": None,
+            "my_error": None,
+        }
+
+    def assertSignals(self, action):
+        self.assertTrue(
+            self.my_pre_log_data["is_called"], "pre_log hook receiver not called"
+        )
+        self.assertIs(self.my_pre_log_data["my_sender"], self.obj.__class__)
+        self.assertIs(self.my_pre_log_data["my_instance"], self.obj)
+        self.assertEqual(self.my_pre_log_data["my_action"], action)
+
+        self.assertTrue(
+            self.my_post_log_data["is_called"], "post_log hook receiver not called"
+        )
+        self.assertIs(self.my_post_log_data["my_sender"], self.obj.__class__)
+        self.assertIs(self.my_post_log_data["my_instance"], self.obj)
+        self.assertEqual(self.my_post_log_data["my_action"], action)
+        self.assertIsNone(self.my_post_log_data["my_error"])
+
+    def test_custom_signals(self):
+        my_ret_val = random.randint(0, 10000)
+        my_other_ret_val = random.randint(0, 10000)
+
+        def pre_log_receiver(sender, instance, action, **_kwargs):
+            self.my_pre_log_data["is_called"] = True
+            self.my_pre_log_data["my_sender"] = sender
+            self.my_pre_log_data["my_instance"] = instance
+            self.my_pre_log_data["my_action"] = action
+            return my_ret_val
+
+        def pre_log_receiver_extra(*_args, **_kwargs):
+            return my_other_ret_val
+
+        def post_log_receiver(
+            sender, instance, action, error, pre_log_results, **_kwargs
+        ):
+            self.my_post_log_data["is_called"] = True
+            self.my_post_log_data["my_sender"] = sender
+            self.my_post_log_data["my_instance"] = instance
+            self.my_post_log_data["my_action"] = action
+            self.my_post_log_data["my_error"] = error
+
+            self.assertEqual(len(pre_log_results), 2)
+
+            found_first_result = False
+            found_second_result = False
+            for pre_log_fn, pre_log_result in pre_log_results:
+                if pre_log_fn is pre_log_receiver and pre_log_result == my_ret_val:
+                    found_first_result = True
+            for pre_log_fn, pre_log_result in pre_log_results:
+                if (
+                    pre_log_fn is pre_log_receiver_extra
+                    and pre_log_result == my_other_ret_val
+                ):
+                    found_second_result = True
+
+            self.assertTrue(found_first_result)
+            self.assertTrue(found_second_result)
+
+            return my_ret_val
+
+        pre_log.connect(pre_log_receiver)
+        pre_log.connect(pre_log_receiver_extra)
+        post_log.connect(post_log_receiver)
+
+        self.obj = SimpleModel.objects.create(text="I am not difficult.")
+
+        self.assertSignals(LogEntry.Action.CREATE)
+
+    def test_custom_signals_update(self):
+        def pre_log_receiver(sender, instance, action, **_kwargs):
+            self.my_pre_log_data["is_called"] = True
+            self.my_pre_log_data["my_sender"] = sender
+            self.my_pre_log_data["my_instance"] = instance
+            self.my_pre_log_data["my_action"] = action
+
+        def post_log_receiver(sender, instance, action, error, **_kwargs):
+            self.my_post_log_data["is_called"] = True
+            self.my_post_log_data["my_sender"] = sender
+            self.my_post_log_data["my_instance"] = instance
+            self.my_post_log_data["my_action"] = action
+            self.my_post_log_data["my_error"] = error
+
+        pre_log.connect(pre_log_receiver)
+        post_log.connect(post_log_receiver)
+
+        self.obj.text = "Changed Text"
+        self.obj.save()
+
+        self.assertSignals(LogEntry.Action.UPDATE)
+
+    def test_custom_signals_delete(self):
+        def pre_log_receiver(sender, instance, action, **_kwargs):
+            self.my_pre_log_data["is_called"] = True
+            self.my_pre_log_data["my_sender"] = sender
+            self.my_pre_log_data["my_instance"] = instance
+            self.my_pre_log_data["my_action"] = action
+
+        def post_log_receiver(sender, instance, action, error, **_kwargs):
+            self.my_post_log_data["is_called"] = True
+            self.my_post_log_data["my_sender"] = sender
+            self.my_post_log_data["my_instance"] = instance
+            self.my_post_log_data["my_action"] = action
+            self.my_post_log_data["my_error"] = error
+
+        pre_log.connect(pre_log_receiver)
+        post_log.connect(post_log_receiver)
+
+        self.obj.delete()
+
+        self.assertSignals(LogEntry.Action.DELETE)
+
+    @patch("auditlog.receivers.LogEntry.objects")
+    def test_signals_errors(self, log_entry_objects_mock):
+        class CustomSignalError(BaseException):
+            pass
+
+        def post_log_receiver(error, **_kwargs):
+            self.my_post_log_data["my_error"] = error
+
+        post_log.connect(post_log_receiver)
+
+        # create
+        error_create = CustomSignalError(LogEntry.Action.CREATE)
+        log_entry_objects_mock.log_create.side_effect = error_create
+        with self.assertRaises(CustomSignalError):
+            SimpleModel.objects.create(text="I am not difficult.")
+        self.assertEqual(self.my_post_log_data["my_error"], error_create)
+
+        # update
+        error_update = CustomSignalError(LogEntry.Action.UPDATE)
+        log_entry_objects_mock.log_create.side_effect = error_update
+        with self.assertRaises(CustomSignalError):
+            obj = SimpleModel.objects.get(pk=self.obj.pk)
+            obj.text = "updating"
+            obj.save()
+        self.assertEqual(self.my_post_log_data["my_error"], error_update)
+
+        # delete
+        error_delete = CustomSignalError(LogEntry.Action.DELETE)
+        log_entry_objects_mock.log_create.side_effect = error_delete
+        with self.assertRaises(CustomSignalError):
+            obj = SimpleModel.objects.get(pk=self.obj.pk)
+            obj.delete()
+        self.assertEqual(self.my_post_log_data["my_error"], error_delete)
 
 
 @override_settings(AUDITLOG_DISABLE_ON_RAW_SAVE=True)

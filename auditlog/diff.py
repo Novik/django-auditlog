@@ -1,4 +1,6 @@
+import json
 from datetime import timezone
+from typing import Optional
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
@@ -73,6 +75,11 @@ def get_field_value(obj, field):
                 value = django_timezone.make_naive(value, timezone=timezone.utc)
         elif isinstance(field, JSONField):
             value = field.to_python(getattr(obj, field.name, None))
+            value = json.dumps(value, sort_keys=True, cls=field.encoder)
+        elif (field.one_to_one or field.many_to_one) and hasattr(field, "rel_class"):
+            value = smart_str(
+                getattr(obj, field.get_attname(), None), strings_only=True
+            )
         else:
             value = smart_str(getattr(obj, field.name, None))
     except ObjectDoesNotExist:
@@ -98,7 +105,9 @@ def mask_str(value: str) -> str:
     return "*" * mask_limit + value[mask_limit:]
 
 
-def model_instance_diff(old, new, fields_to_check=None):
+def model_instance_diff(
+    old: Optional[Model], new: Optional[Model], fields_to_check=None
+):
     """
     Calculates the differences between two model instances. One of the instances may be ``None``
     (i.e., a newly created model or deleted model). This will cause all fields with a value to have
