@@ -405,7 +405,8 @@ class LogEntry(models.Model):
         """
         :return: The changes recorded in this log entry as a dictionary object.
         """
-        return self.changes or {}
+        ret = self.changes or {}
+        return json.loads(ret) if isinstance(ret, str) else ret
 
     @property
     def changes_str(self, colon=": ", arrow=" \u2192 ", separator="; "):
