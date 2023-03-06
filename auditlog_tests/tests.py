@@ -21,6 +21,7 @@ from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
 from django.utils import dateformat, formats
 from django.utils import timezone as django_timezone
+from django.utils.encoding import smart_str
 
 from auditlog.admin import LogEntryAdmin
 from auditlog.cid import get_cid
@@ -398,6 +399,20 @@ class ManyRelatedModelTest(TestCase):
         log_entry = self.obj.history.first()
         self.assertEqual(
             log_entry.additional_data, {"related_model_id": self.related.id}
+        )
+
+    def test_changes(self):
+        self.obj.related.add(self.related)
+        log_entry = self.obj.history.first()
+        self.assertEqual(
+            log_entry.changes,
+            {
+                "related": {
+                    "type": "m2m",
+                    "operation": "add",
+                    "objects": [smart_str(self.related)],
+                }
+            },
         )
 
 
@@ -1460,6 +1475,17 @@ class AdminPanelTest(TestCase):
             with self.settings(TIME_ZONE=tz):
                 created = self.admin.created(log_entry)
                 self.assertEqual(created.strftime("%Y-%m-%d %H:%M:%S"), timestamp)
+
+    @freezegun.freeze_time("2022-08-01 12:00:00Z")
+    def test_created_naive_datetime(self):
+        with self.settings(USE_TZ=False):
+            obj = SimpleModel.objects.create(text="For USE_TZ=False test")
+            log_entry = obj.history.latest()
+            created = self.admin.created(log_entry)
+            self.assertEqual(
+                created.strftime("%Y-%m-%d %H:%M:%S"),
+                "2022-08-01 12:00:00",
+            )
 
     def test_cid(self):
         self.client.force_login(self.user)
