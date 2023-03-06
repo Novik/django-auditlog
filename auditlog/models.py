@@ -126,15 +126,13 @@ class LogEntryManager(models.Manager):
                 kwargs.setdefault("additional_data", get_additional_data())
 
             objects = [smart_str(instance) for instance in changed_queryset]
-            kwargs["changes"] = json.dumps(
-                {
-                    field_name: {
-                        "type": "m2m",
-                        "operation": operation,
-                        "objects": objects,
-                    }
+            kwargs["changes"] = {
+                field_name: {
+                    "type": "m2m",
+                    "operation": operation,
+                    "objects": objects,
                 }
-            )
+            }
             kwargs.setdefault("cid", get_cid())
             return self.create(**kwargs)
 
@@ -366,7 +364,11 @@ class LogEntry(models.Model):
         verbose_name=_("actor"),
     )
     cid = models.CharField(
-        max_length=255, db_index=True, blank=True, null=True, verbose_name=_("Correlation ID")
+        max_length=255, 
+        db_index=True, 
+        blank=True, 
+        null=True, 
+        verbose_name=_("Correlation ID"),
     )
     remote_addr = models.GenericIPAddressField(
         blank=True, null=True, verbose_name=_("remote address")
@@ -405,8 +407,7 @@ class LogEntry(models.Model):
         """
         :return: The changes recorded in this log entry as a dictionary object.
         """
-        ret = self.changes or {}
-        return json.loads(ret) if isinstance(ret, str) else ret
+        return self.changes or {}
 
     @property
     def changes_str(self, colon=": ", arrow=" \u2192 ", separator="; "):
