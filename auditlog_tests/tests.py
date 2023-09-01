@@ -16,9 +16,10 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser, User
 from django.contrib.contenttypes.models import ContentType
 from django.core import management
+from django.db import models
 from django.db.models.signals import pre_save
 from django.test import RequestFactory, TestCase, override_settings
-from django.urls import reverse
+from django.urls import resolve, reverse
 from django.utils import dateformat, formats
 from django.utils import timezone as django_timezone
 from django.utils.encoding import smart_str
@@ -35,6 +36,7 @@ from auditlog_tests.fixtures.custom_get_cid import get_cid as custom_get_cid
 from auditlog_tests.models import (
     AdditionalDataIncludedModel,
     AltPrimaryKeyModel,
+    AutoManyRelatedModel,
     CharfieldTextfieldModel,
     ChoicesFieldModel,
     DateTimeFieldModel,
@@ -54,6 +56,7 @@ from auditlog_tests.models import (
     SimpleMappingModel,
     SimpleMaskedModel,
     SimpleModel,
+    SimpleNonManagedModel,
     UUIDPrimaryKeyModel,
 )
 
@@ -414,6 +417,24 @@ class ManyRelatedModelTest(TestCase):
                 }
             },
         )
+
+    def test_adding_existing_related_obj(self):
+        self.obj.related.add(self.related)
+        log_entry = self.obj.history.first()
+        self.assertEqual(
+            log_entry.changes,
+            {
+                "related": {
+                    "type": "m2m",
+                    "operation": "add",
+                    "objects": [smart_str(self.related)],
+                }
+            },
+        )
+        # Add same related obj again.
+        self.obj.related.add(self.related)
+        latest_log_entry = self.obj.history.first()
+        self.assertEqual(log_entry.id, latest_log_entry.id)
 
 
 class MiddlewareTest(TestCase):
@@ -1117,7 +1138,7 @@ class RegisterModelSettingsTest(TestCase):
 
         self.assertTrue(self.test_auditlog.contains(SimpleExcludeModel))
         self.assertTrue(self.test_auditlog.contains(ChoicesFieldModel))
-        self.assertEqual(len(self.test_auditlog.get_models()), 23)
+        self.assertEqual(len(self.test_auditlog.get_models()), 25)
 
     def test_register_models_register_model_with_attrs(self):
         self.test_auditlog._register_models(
@@ -1311,6 +1332,32 @@ class RegisterModelSettingsTest(TestCase):
                 SimpleModel, serialize_kwargs={"fields": ["text", "integer"]}
             )
 
+    @override_settings(AUDITLOG_INCLUDE_ALL_MODELS=True)
+    def test_register_from_settings_register_all_models_excluding_non_managed_models(
+        self,
+    ):
+        self.test_auditlog.register_from_settings()
+
+        self.assertFalse(self.test_auditlog.contains(SimpleNonManagedModel))
+
+    @override_settings(AUDITLOG_INCLUDE_ALL_MODELS=True)
+    def test_register_from_settings_register_all_models_and_figure_out_m2m_fields(self):
+        self.test_auditlog.register_from_settings()
+
+        self.assertIn(
+            "related", self.test_auditlog._registry[AutoManyRelatedModel]["m2m_fields"]
+        )
+
+    @override_settings(AUDITLOG_INCLUDE_ALL_MODELS=True)
+    def test_register_from_settings_register_all_models_including_auto_created_models(
+        self,
+    ):
+        self.test_auditlog.register_from_settings()
+
+        self.assertTrue(
+            self.test_auditlog.contains(AutoManyRelatedModel.related.through)
+        )
+
 
 class ChoicesFieldModelTest(TestCase):
     def setUp(self):
@@ -1502,6 +1549,23 @@ class AdminPanelTest(TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn(expected_response, res.rendered_content)
 
+    def test_has_delete_permission(self):
+        log = self.obj.history.latest()
+        obj_pk = self.obj.pk
+        delete_log_request = RequestFactory().post(
+            f"/admin/auditlog/logentry/{log.pk}/delete/"
+        )
+        delete_log_request.resolver_match = resolve(delete_log_request.path)
+        delete_log_request.user = self.user
+        delete_object_request = RequestFactory().post(
+            f"/admin/tests/simplemodel/{obj_pk}/delete/"
+        )
+        delete_object_request.resolver_match = resolve(delete_object_request.path)
+        delete_object_request.user = self.user
+
+        self.assertTrue(self.admin.has_delete_permission(delete_object_request, log))
+        self.assertFalse(self.admin.has_delete_permission(delete_log_request, log))
+
 
 class DiffMsgTest(TestCase):
     def setUp(self):
@@ -1650,6 +1714,19 @@ class DiffMsgTest(TestCase):
         )
         # Re-register
         auditlog.register(SimpleModel)
+
+    def test_field_verbose_name(self):
+        log_entry = self._create_log_entry(
+            LogEntry.Action.CREATE,
+            {"test": "test"},
+        )
+
+        self.assertEqual(self.admin.field_verbose_name(log_entry, "actor"), "Actor")
+        with patch(
+            "django.contrib.contenttypes.models.ContentType.model_class",
+            return_value=None,
+        ):
+            self.assertEqual(self.admin.field_verbose_name(log_entry, "actor"), "actor")
 
 
 class NoDeleteHistoryTest(TestCase):
@@ -1857,6 +1934,32 @@ class TestRelatedDiffs(TestCase):
         self.assertEqual(int(log_one.changes_dict["related"][1]), one_simple.id)
         self.assertEqual(int(log_one.changes_dict["one_to_one"][1]), simple.id)
         self.assertEqual(int(log_two.changes_dict["related"][1]), two_simple.id)
+
+    def test_log_entry_changes_on_fk_object_id_update(self):
+        t1 = self.test_date
+        with freezegun.freeze_time(t1):
+            simple = SimpleModel.objects.create()
+            one_simple = SimpleModel.objects.create()
+            two_simple = SimpleModel.objects.create()
+            instance = RelatedModel.objects.create(
+                one_to_one=simple, related=one_simple
+            )
+
+        t2 = self.test_date + datetime.timedelta(days=20)
+        with freezegun.freeze_time(t2):
+            instance.related_id = two_simple.id
+            instance.one_to_one = one_simple
+            instance.save(update_fields=["related_id", "one_to_one_id"])
+
+        log_one = instance.history.filter(timestamp=t1).first()
+        log_two = instance.history.filter(timestamp=t2).first()
+        self.assertTrue(isinstance(log_one, LogEntry))
+        self.assertTrue(isinstance(log_two, LogEntry))
+
+        self.assertEqual(int(log_one.changes_dict["related"][1]), one_simple.id)
+        self.assertEqual(int(log_one.changes_dict["one_to_one"][1]), simple.id)
+        self.assertEqual(int(log_two.changes_dict["related"][1]), two_simple.id)
+        self.assertEqual(int(log_two.changes_dict["one_to_one"][1]), one_simple.id)
 
     def test_log_entry_changes_on_fk_id_update(self):
         t1 = self.test_date
@@ -2185,6 +2288,24 @@ class TestModelSerialization(TestCase):
                 "subheading": "use a natural key for this serialization, please.",
                 "value": 11,
             },
+        )
+
+    def test_f_expressions(self):
+        serialize_this = SerializeThisModel.objects.create(
+            label="test label",
+            nested={"foo": "bar"},
+            timestamp=self.test_date,
+            nullable=1,
+        )
+        serialize_this.nullable = models.F("nullable") + 1
+        serialize_this.save()
+
+        log = serialize_this.history.first()
+        self.assertTrue(isinstance(log, LogEntry))
+        self.assertEqual(log.action, 1)
+        self.assertEqual(
+            log.serialized_data["fields"]["nullable"],
+            "F(nullable) + Value(1)",
         )
 
 

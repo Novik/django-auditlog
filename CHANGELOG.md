@@ -4,7 +4,17 @@
 
 #### Breaking Changes
 
-- feat: Change `LogEntry.change` field type to `JSONField` rather than `TextField`. This change include a migration that may take time to run depending on the number of records on your `LogEntry` table ([#407](https://github.com/jazzband/django-auditlog/pull/407))
+#### Improvements
+
+#### Fixes
+
+## 3.0.0-beta.1
+
+#### Breaking Changes
+
+- feat: Change `LogEntry.change` field type to `JSONField` rather than `TextField`. This change include a migration that may take time to run depending on the number of records on your `LogEntry` table ([#407](https://github.com/jazzband/django-auditlog/pull/407))([#495](https://github.com/jazzband/django-auditlog/pull/495))
+- Python: Drop support for Python 3.7 ([#546](https://github.com/jazzband/django-auditlog/pull/546))
+- feat: Set `AuditlogHistoryField.delete_related` to `False` by default. This is different from the default configuration of Django's `GenericRelation`, but we should not erase the audit log of objects on deletion by default. ([#557](https://github.com/jazzband/django-auditlog/pull/557))
 
 #### Improvements
 
@@ -13,12 +23,17 @@
 - feat: Added pre-log and post-log signals. ([#483](https://github.com/jazzband/django-auditlog/pull/483))
 - feat: Make timestamp in LogEntry overwritable. ([#476](https://github.com/jazzband/django-auditlog/pull/476))
 - feat: Support excluding field names globally when ```AUDITLOG_INCLUDE_ALL_MODELS``` is enabled. ([#498](https://github.com/jazzband/django-auditlog/pull/498))
+- feat: Improved auto model registration to include auto-created models and exclude non-managed models, and automatically register m2m fields for models. ([#550](https://github.com/jazzband/django-auditlog/pull/550))
 
 #### Fixes
 
+- fix: Audit changes to FK fields when saved using `*_id` naming. ([#525](https://github.com/jazzband/django-auditlog/pull/525))
 - fix: Fix a bug in audit log admin page when `USE_TZ=False`. ([#511](https://github.com/jazzband/django-auditlog/pull/511))
 - fix: Make sure `LogEntry.changes_dict()` returns an empty dict instead of `None` when `json.loads()` returns `None`. ([#472](https://github.com/jazzband/django-auditlog/pull/472))
 - fix: Always set remote_addr even if the request has no authenticated user. ([#484](https://github.com/jazzband/django-auditlog/pull/484))
+- fix: Fix a bug in getting field's `verbose_name` when model is not accessible. ([508](https://github.com/jazzband/django-auditlog/pull/508))
+- fix: Fix a bug in `serialized_data` with F expressions. ([508](https://github.com/jazzband/django-auditlog/pull/508))
+- fix: Make log entries read-only in the admin. ([#449](https://github.com/jazzband/django-auditlog/pull/449), [#556](https://github.com/jazzband/django-auditlog/pull/556)) (applied again after being reverted in 2.2.2)
 
 ## 2.2.2 (2023-01-16)
 
